@@ -1,0 +1,461 @@
+---
+title: "EDLD 654 Final Project"
+format: html
+editor: visual
+code-fold: show
+embed-resources: true
+---
+
+::: panel-tabset
+## Code
+
+### The Population Assessment of Tobacco and Health (PATH): A Secondary Data Machine Learning Analysis
+
+Maya Casper
+
+#### Data Pre-processing
+
+```{r, message=FALSE, warning=FALSE}
+library(readr)
+library(finalfit)
+library(descriptr)
+library(dplyr)
+library(recipes)
+library(pacman)
+library(readr)
+require(caret)
+require(kknn)
+library(ranger)
+library(cutpointr)
+library(kableExtra)
+library(vip)
+library(ggplot2)
+library(caret)
+library(forcats)
+
+
+## Load in data
+final_data <- read_csv("Data_set/cleaned_data.csv")
+
+## Removed unnecessary predictors 
+data <- final_data %>% 
+  select(-...1, -R04R_Y_EVR_CIGS, -R04R_Y_EVR_THRSH_CIGS, -R04R_Y_CUR_CIGS, -R04R_Y_CUR_BIDI, -R04R_Y_EVR_THRSH_GFILTR, -R04R_Y_CUR_KRETEK, -R04R_Y_CUR_PIPE)
+
+
+#Check for missingness - remove missingness 
+data <- data[, which(colMeans(!is.na(data)) > 0.75)]
+
+# Rename & define outcome 
+names(data)[names(data) == 'R04_YC1103'] <- 'curious'
+outcome <- c('curious')
+data <- data[!is.na(data$curious),]
+data$curious <- as.factor(data$curious)
+typeof(data$curious)
+
+#Collapse outcome 
+data <- data %>% 
+  mutate(curious = fct_collapse(curious, 
+                                   not = c("4"), 
+                                   yes = c("3", "2", "1")))
+
+unique(data$curious)
+table(data$curious)
+data$curious <- ifelse(data$curious=='yes',1,0)
+
+
+#Identify recipe pieces 
+id      <- c('PERSONID')
+numeric <- c('R04R_Y_BMI')  
+
+#Create categorical predictors and factorize 
+categorical <- data %>%
+  select(-R04R_Y_BMI, -PERSONID, -curious)
+for (i in seq_along(categorical)) {
+  data[[i]] <- as.factor(data[[i]])
+}
+
+#Numeric continious variables 
+data$R04R_Y_BMI <- as.numeric(as.character(data$R04R_Y_BMI))
+typeof(data$R04R_Y_BMI)
+data$curious <- as.numeric(as.character(data$curious))
+data$PERSONID <-as.integer(data$PERSONID)
+
+
+categorical_cols <- colnames(categorical)
+data <- data %>%
+  mutate(across(all_of(categorical_cols), as.factor))
+ 
+# after_preprocessing <- data %>%
+#   mutate(across(all_of(categorical_cols), as.factor))
+# 
+# sapply(after_preprocessing[categorical_cols], function(col) unique(col))
+```
+
+```{r}
+# Define the recipe with the necessary transformations
+blueprint <- recipe(x = data,
+                    vars  = c(numeric,categorical_cols,outcome, id),
+                    roles = c(rep('predictor', 222), 'outcome', 'ID')) %>%
+  step_indicate_na(all_of(categorical_cols),all_of(numeric))%>%
+  step_impute_mean(all_of(numeric)) %>%
+  step_zv(all_numeric(), all_of(categorical_cols)) %>%
+  step_impute_mode(all_of(categorical_cols)) %>%
+  step_poly(all_of(numeric), degree = 2) %>%
+  step_normalize(paste0(numeric, '_poly_1'),
+                 paste0(numeric, '_poly_2')) %>%
+  step_dummy(all_of(categorical_cols), one_hot = TRUE) %>% 
+  step_num2factor(all_of(outcome),
+                  transform = function(x) x + 1,
+                  levels=c('No','Yes'))
+
+
+#Test data set 
+set.seed(12082024)
+loc <- sample(1:nrow(data), nrow(data) * 0.8)
+test <- data[-loc, ]
+train  <- data[loc, ]
+dim(test)
+
+# Randomly shuffle the data
+train = train[sample(nrow(train)),]
+
+# Create 10 folds with equal size
+folds = cut(seq(1,nrow(train)),breaks=10,labels=FALSE)
+
+# Create the list for each fold 
+my.indices <- vector('list',10)
+for(i in 1:10){
+  my.indices[[i]] <- which(folds!=i)
+}
+
+#Create the training control 
+cv <- trainControl(method = "cv",
+                   index  = my.indices, 
+                   classProbs = TRUE,
+                   summaryFunction = mnLogLoss, 
+                   verboseIter = TRUE)
+```
+
+#### Model Building
+
+```{r}
+#Reg Regression 
+
+cv.5 <- trainControl(method = "cv",
+                     index  = my.indices, 
+                     verboseIter = TRUE)   
+
+# I saved and reloded to save processing time 
+# log_reg<- caret::train(blueprint, 
+#                        data      = train, 
+#                        method    = "glm",
+#                        family    = 'binomial',
+#                        metric    = 'logLoss',
+#                        trControl = cv.5)
+#saveRDS(log_reg, file ='log_reg.rsd')
+log_reg <- readRDS('log_reg.rsd')
+
+
+predicted_te_reg <- predict(log_reg, test, type='prob')
+
+#Evaluation of model 
+cut.obj_reg <- cutpointr(x     = predicted_te_reg$Yes,
+                      class = test$curious)
+reg_auc<-auc(cut.obj_reg)
+#Confusion matrix
+pred_class_reg <- ifelse(predicted_te_reg$Yes>.5,1,0)
+confusion_reg <- table(test$curious, pred_class_reg)
+tnr_reg <- confusion_reg[1,1]/(confusion_reg[1,1]+confusion_reg[1,2])
+fpr_reg <- confusion_reg[1,2]/(confusion_reg[1,1]+confusion_reg[1,2])
+tpr_reg <- confusion_reg[2,2]/(confusion_reg[2,1]+confusion_reg[2,2])
+prec_reg <-confusion_reg[2,2]/(confusion_reg[1,2]+confusion_reg[2,2])
+```
+
+#### Model Building
+
+```{r}
+### Ridge 
+grid_ridge1 <- data.frame(alpha = 0, lambda = seq(0.01,0.2,.05)) 
+
+# ridge1 <- caret::train(blueprint, 
+#                        data      = train, 
+#                        method    = "glmnet", 
+#                        family    = 'binomial',
+#                        metric    = 'logLoss',
+#                        trControl = cv,
+#                        tuneGrid  = grid_ridge1)
+
+#saveRDS(ridge1, file ='ridge.rsd')
+ridge1 <- readRDS('ridge.rsd')
+ridge_plot <- plot(ridge1)
+ridge_plot
+ridge1$bestTune
+ridge1$results[3,]
+
+
+# Performance Evaluation 
+predicted_te_ridge <- predict(ridge1, test, type='prob')
+
+cut.obj.ridge<- cutpointr(x     = predicted_te_ridge$Yes,
+                           class = test$curious)
+
+ridge_auc <- auc(cut.obj.ridge)
+
+pred_class_ridge <- ifelse(predicted_te_ridge$Yes>.5,1,0)
+
+confusion_ridge <- table(test$curious, pred_class_ridge)
+tnr_ridge <- confusion_ridge[1,1]/(confusion_ridge[1,1]+confusion_ridge[1,2])
+fpr_ridge <- confusion_ridge[1,2]/(confusion_ridge[1,1]+confusion_ridge[1,2])
+tpr_ridge <- confusion_ridge[2,2]/(confusion_ridge[2,1]+confusion_ridge[2,2])
+prec_ridge <-confusion_ridge[2,2]/(confusion_ridge[1,2]+confusion_ridge[2,2])
+```
+
+```{r}
+### Lasso 
+lasso_grid <- data.frame(alpha = 1, lambda = seq(0.001 ,0.5, .01)) 
+
+# log_lasso <- caret::train(blueprint, 
+#                            data      = train, 
+#                            method    = "glmnet",
+#                            trControl = cv,
+#                            tuneGrid  = lasso_grid)
+log_lasso <- readRDS('lasso.rsd')
+lasso_plot <- plot(log_lasso)
+lasso_plot
+log_lasso$bestTune
+log_lasso$results[2,]
+#saveRDS(log_lasso, file ='lasso.rsd')
+
+
+# Performance Evaluation 
+predicted_te_lasso <- predict(log_lasso, test, type='prob')
+
+cut.obj.lasso <- cutpointr(x     = predicted_te_lasso$Yes,
+                     class = test$curious)
+
+lasso_auc <- auc(cut.obj.lasso)
+
+pred_class_lasso <- ifelse(predicted_te_lasso$Yes>.5,1,0)
+
+confusion_lasso <- table(test$curious, pred_class_lasso)
+tnr_lasso <- confusion_lasso[1,1]/(confusion_lasso[1,1]+confusion_lasso[1,2])
+fpr_lasso <- confusion_lasso[1,2]/(confusion_lasso[1,1]+confusion_lasso[1,2])
+tpr_lasso <- confusion_lasso[2,2]/(confusion_lasso[2,1]+confusion_lasso[2,2])
+prec_lasso <-confusion_lasso[2,2]/(confusion_lasso[1,2]+confusion_lasso[2,2])
+```
+
+```{r}
+## Elastic nets 
+elastic_grid <- expand.grid(alpha = seq(0,1,.1), lambda = seq(0.01,1,.1)) 
+
+# elastic <- caret::train(blueprint, 
+#                       data = train, 
+#                       method = 'glmnet', 
+#                       trControl = cv, 
+#                       tuneGrid = elastic_grid)
+#saveRDS(elastic, file ='elastic.rsd')
+elastic <- readRDS("Final/elastic.rsd")
+elastic_plot<- plot(elastic)
+elastic_plot
+elastic$bestTune
+elastic$results[41,]
+
+# Performance Evaluation 
+predicted_te_elastic <- predict(elastic, test, type='prob')
+
+cut.obj.elastic <- cutpointr(x     = predicted_te_elastic$Yes,
+                           class = test$curious)
+elastic_auc <- auc(cut.obj.elastic)
+
+pred_class_elastic <- ifelse(predicted_te_elastic$Yes>.5,1,0)
+
+confusion_elastic<- table(test$curious, pred_class_elastic)
+tnr_elastic <- confusion_elastic[1,1]/(confusion_elastic[1,1]+confusion_elastic[1,2])
+fpr_elastic <- confusion_elastic[1,2]/(confusion_elastic[1,1]+confusion_elastic[1,2])
+tpr_elastic <- confusion_elastic[2,2]/(confusion_elastic[2,1]+confusion_elastic[2,2])
+prec_elastic <-confusion_elastic[2,2]/(confusion_elastic[1,2]+confusion_elastic[2,2])
+```
+
+```{r}
+### Random Forest 
+bagged_grid <-expand.grid(mtry =222, 
+                          splitrule = 'gini', 
+                          min.node.size=30)
+
+nbags <- c(160,seq(180,260,20))
+
+# bags <- vector('list',length(nbags))
+# 
+# for(i in 1:length(nbags)){
+#   bags[[i]] <- caret::train(blueprint,
+#                             data      = train,
+#                             method    = 'ranger',
+#                             trControl = cv,
+#                             tuneGrid  = bagged_grid,
+#                             metric    = 'logLoss',
+#                             num.trees = nbags[i],
+#                             max.depth = 60)
+# }
+# 
+#saveRDS(bags, file='bags.rds')
+
+bags <- readRDS('bags.rds')
+logLoss_ <- c()
+
+for(i in 1:length(nbags)){
+
+  logLoss_[i] = bags[[i]]$results$logLoss
+
+}
+
+
+
+
+#Plotted number of bags tunning 
+bags_plot <- ggplot()+
+  geom_line(aes(x=nbags,y=logLoss_))+
+  xlab('Number ofs')+
+  ylab('Negative LogLoss')+
+  ylim(c(0.1,1))+
+  theme_bw()
+bags_plot
+nbags[which.min(logLoss_)]
+
+# Performance Evaluation
+#Use 11 because 200 was the nbags min
+predicted_bags <- predict(bags[[11]], test, type='prob')
+cut.obj.rf <- cutpointr(x     = predicted_bags$Yes,
+                        class = test$curious)
+
+auc_rf <- auc(cut.obj.rf)
+pred_class_rf <- ifelse(predicted_bags$Yes>.5,1,0)
+confusion_rf<- table(test$curious, pred_class_rf)
+tnr_rf <- confusion_rf[1,1]/(confusion_rf[1,1]+confusion_rf[1,2])
+fpr_rf <- confusion_rf[1,2]/(confusion_rf[1,1]+confusion_rf[1,2])
+tpr_rf <- confusion_rf[2,2]/(confusion_rf[2,1]+confusion_rf[2,2])
+prec_rf <-confusion_rf[2,2]/(confusion_rf[1,2]+confusion_rf[2,2])
+```
+
+#### Model Comparison
+
+```{r}
+#### Model Comparison 
+
+results_comparison <- data.frame(
+  Model = c( "Regular Regression", "Elastic Regression", "Ridge Regression", "Lasso Regression", "Bagged Tree"),
+   AUC = c(reg_auc, elastic_auc, ridge_auc, lasso_auc, auc_rf),
+  `True Negative Rate` = c(tnr_reg, tnr_elastic, tnr_ridge, tnr_lasso, tnr_rf),
+  `False Positive Rate` = c(fpr_reg, fpr_elastic, fpr_ridge, fpr_lasso, fpr_rf), 
+  `True Positive Rate` = c(tpr_reg, tpr_elastic, tpr_ridge, tpr_lasso, tpr_rf), 
+  `Precision` = c(prec_reg, prec_elastic, prec_ridge, prec_lasso, prec_rf))
+
+kable_table_total <- results_comparison %>%
+  kbl(caption = "Table 1: Model Perfomance Results", align = "c") %>%
+  kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover", "condensed"))
+kable_table_total
+```
+
+#### Variable Predictors
+
+```{r}
+#Variable performance 
+options(scipen=99)
+coefs <- coef(elastic$finalModel,elastic$bestTune$lambda)
+ind   <- order(abs(coefs),decreasing=T)
+
+head(as.matrix(coefs[ind[-1],]),10)
+
+
+predict_plot <- vip(elastic, 
+    num_features = 10, 
+    geom = "point") + 
+  theme_bw()
+predict_plot
+```
+
+## Paper
+
+#### 1.1 Research Problem
+Adolescent tobacco use remains a critical public health concern, with significant implications for individual health, societal well-being, and policy structure and development. According to the CDC, it is estimated that 2.3% of adolescents 12-17 smoked in the past month (CDC, 2019). Additionally, more recent statistics have estimated that 5.9% of students currently use e-cigarettes (CDC, 2024) accounting for 1.63 million adolescents.  The Population Assessment of Tobacco and Health (PATH) Study was conducted by the National Institute on Drug Abuse (NIDA), the National Institutes of Health (NIH), the Center for Tobacco Products (CTP), and the Food and Drug Administration (FDA) represents a plethora of data on tobacco-related attitudes and behaviors. This longitudinal study provides invaluable insights into how tobacco use patterns, attitudes, and exposure evolve. This is especially true among children and adolescents. 
+
+ Since its inception in 2011, the PATH study has helped inform policy and other regulatory activities under the Family Smoking Prevention and Tobacco Control Act, which seeks to reduce tobacco use through evidence-based policies. This study recognizes the diverse forms of tobacco use including cigarettes, hookah, and smokeless tobacco and includes tobacco-related attitudes including perceived risks and social norms. It is because of this, the dataset has been instrumental in the creation of public health interventions and policy decisions. The study currently has six waves of data collection allowing for researchers to observe changes in perception in the United States as time goes on and with the introduction of new products. For the purposes of this study, I utilized Wave 6 (2021), using the publicly available data from youth and parent questionnaire responses to dig deeper into adolescent smoking behaviors.
+
+This machine-learning project utilizes the 6th wave of the PATH data to predict smoking curiosity among self-reported non-smoking youth and adolescents. The literature points to the association between curiosity about smoking and future smoking, with results indicating curious youth initiate smoking at a higher rate than their non-curious counterparts (Pierce et al., 2025). We hypothesize that through the use of machine learning, we will be able to identify pertinent individual and contextual predictors of smoking curiosity. This will be highly informative to prevention work as these predictions will likely improve the identification of youth at risk of future smoking initiation.
+
+Additionally, identification of these important variables may allow for earlier intervention by identifying young people at-risk of future smoking behavior by predicting smoking curiosity before the presentation of other risk factors such as peer cigarette use or consuming alcohol or cannabis (Nodora et al., 2014, Pierce et al., 2005, Portnoy et al., 2014). 
+
+#### 1.2 Data description
+The PATH data set collected a wide variety of questions relating to demographics,  tobacco use patterns, attitudes, and exposure. The initial sample consisted of 14,798 participants with 1389 total variables. During the cleaning process, we removed any variables with missingness above 75%. Much of this missingness was due to an instrument skip pattern for one or more component variables, and data in these variables was only available for a small subset of the sample and was not missing at random. This removed all variables related to smoking experience, frequency, and identity, as only % of participants indicated previous smoking status which created a high percent of missingness for these variables. Additionally, we removed any existing participants with missingness on the outcome variable of interest. Only one continuous variable remained after data cleaning R04R_Y_BMI: Youth Body Mass Index (BMI), all other variables were categorical. 
+
+In the original data the outcome variable R04_YC1103: Have you ever been curious about smoking a cigarette?, was coded as a factor with four levels, 1 = Very curious,  2 = Somewhat curious, 3 = A little curious, 4 = Not at all curious. For analysis, we collapsed the levels to 0 = Not at all curious & 1 = Curious (which included 1 = Very curious,  2 = Somewhat curious, 3 = A little curious) and utilized the variable as a binary outcome using linear probability for modeling. During the initial cleaning, we also excluded all respondents with a missing value for this variable. This was done for best practice and also as a way to remove any self-reported smokers, as this question was only prompted to participants who indicated never having smoked. 
+Additionally, to prepare the data for analysis during the preprocessing stage, we utilized the recipes package to impute missing categorical values with the mean and categorical values with the mode. We also removed any predictors that had no variation and created and normalized numeric predictors. Finally, we created dummy variables for all categorical predictors. 
+
+
+#### 1.3 Model description
+
+*General Modeling Approach*
+
+Before fitting my models we employed an 80/20 resampling strategy to balance model bias and model variance. To allow for reproducibility we opted to utilize the set.seed function and manually sample my folds instead of allowing the carat function to randomly assign without the ability to reproduce results. Additionally, we utilized a 10-fold cross-validation when training the model to improve model accuracy and generalization capabilities.
+
+
+*Model Specific Approaches*
+
+While model fitting we used a tuning grid to tune the hyperparameters in the regularized regression models. For the elastic net model, we tuned both the alpha and lambda hyperparameters. In future iterations of this model-fitting process, we plan to use a more precise grid with smaller increments between grid values to more precisely identify parameters (computer rendering power limited me this time). For the ridge model alpha was set to 0 and we used the grid to tune the lambda value. In the lasso model, the alpha was set to 1 and we once again used the grid to tune the lambda value.
+
+For our bagged tree model, we tuned the number of trees as a hyperparameter of our model search for the optimal number of trees. We did this through the  caret::train function and iterated over a set of values for the num.trees argument from 5 to 200. We then compared the negative log loss between tree number and picked the optimal number of tree models. In this case, negative log loss stabilized at around 50. For the mtry value we used the number of predictors in our model.
+
+*Ridge Hyperparameter Tuning*
+```{r, echo=FALSE}
+ridge_plot
+```
+
+*Lasso Hyperparameter Tuning*
+```{r, echo=FALSE}
+lasso_plot
+```
+
+*Elastic Net Hyperparameter Tuning*
+```{r, echo=FALSE}
+elastic_plot
+```
+
+*Bagged Tree Hyperparameter Tuning*
+```{r, echo=FALSE}
+bags_plot
+```
+
+We plan to evaluate model performances based on the area under the ROC curve (AUC), true positive rate (TPR), true negative rate (TNR), false positive rate (FPR),  false negative rate (FNR) and positive predicted value (precision).
+
+
+#### 1.4 Model fit
+To find the best model to predict smoking curiosity we ran an elastic regression, ridge regression, lasso regression and, bagged tree models. For this analysis, we opted to utilize the standard 0.5 cut-off value to generate class predictions. In this context, the consequences of false positives or false negatives are minimal making 0.5 an adequate fit. We did consider alternative thresholds however, the results at 0.5 showed balanced performance.
+
+We evaluated each model on our test data set and reported AUC, TNR, TPR, FPR, and precision values for each model (Table 2). Based on these evaluation metrics elastic regression performed the best out of the model tested. The elastic regression had the highest AUC (0.8919), indicating the strongest predictive power. It also had the highest precision (77.84%), and the best trade-off between TNR (96.19%) and TPR (50.91%). While bagged tree achieved the highest TPR (55.62%), their lower precision and higher FPR, as well as the significant render time make it less favorable. Additionally, ridge and lasso regression were viable options, but elastic regression consistently outperforms them in this comparison.
+
+```{r, echo=FALSE}
+kable_table_total
+```
+
+#### 1.5 Discussion/Conclusion
+					
+The five most important variables in predicting smoking curiosity were: 
+R04_YS1206: Think you will use smokeless tobacco in the next year	(highest importance) 		
+R04_YV1103: Ever been curious about using an electronic nicotine product 		
+R04_YG9015: Think you will try a filtered cigar soon 					
+R04_YC1206: Think you will smoke a cigarette in the next year 	
+R04_YG9010: Ever been curious about smoking a traditional cigar 
+
+
+I am not surprised that these variables are the most important in predicting smoking curiosity. It is intuitive that the perceived future use of cigarettes and other tobacco products most closely predicts smoking curiosity. Additionally, curiosity about other tobacco products once again is intuitively connected to cigarette use. Literature confirms this finding and suggests that curiosity about alcohol and other substances may also be predictive of cigarette curiosity, we would not be surprised to find these as predictors lower down the list. 
+
+Generally, all of the models besides the regularized regression were relatively close in model performance. While we feel the elastic net was the highest-performing model we do not feel it performed substantially better than any of the other models and there was not a significant difference in predicting ability. 
+Unfortunately, we do not feel there were any practical findings in my model results. The most important variables identified were intuitively related to the predictor itself and did not contribute to new findings in the field. 
+
+```{r, echo=FALSE}
+predict_plot
+```
+
+				
+:::
