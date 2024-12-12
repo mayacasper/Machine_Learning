@@ -145,15 +145,15 @@ cv.5 <- trainControl(method = "cv",
                      index  = my.indices, 
                      verboseIter = TRUE)   
 
-# I saved and reloded to save processing time 
-# log_reg<- caret::train(blueprint, 
-#                        data      = train, 
-#                        method    = "glm",
-#                        family    = 'binomial',
-#                        metric    = 'logLoss',
-#                        trControl = cv.5)
+# I saved and reloded to save processing time but the file is too big for GitHub - might take a while to run 
+ log_reg<- caret::train(blueprint, 
+                        data      = train, 
+                        method    = "glm",
+                        family    = 'binomial',
+                        metric    = 'logLoss',
+                        trControl = cv.5)
 #saveRDS(log_reg, file ='log_reg.rsd')
-log_reg <- readRDS('log_reg.rsd')
+#log_reg <- readRDS('log_reg.rsd')
 
 
 predicted_te_reg <- predict(log_reg, test, type='prob')
@@ -284,22 +284,21 @@ bagged_grid <-expand.grid(mtry =222,
 
 nbags <- c(160,seq(180,260,20))
 
-# bags <- vector('list',length(nbags))
-# 
-# for(i in 1:length(nbags)){
-#   bags[[i]] <- caret::train(blueprint,
-#                             data      = train,
-#                             method    = 'ranger',
-#                             trControl = cv,
-#                             tuneGrid  = bagged_grid,
-#                             metric    = 'logLoss',
-#                             num.trees = nbags[i],
-#                             max.depth = 60)
-# }
-# 
+ bags <- vector('list',length(nbags))
+ 
+ for(i in 1:length(nbags)){
+   bags[[i]] <- caret::train(blueprint,
+                             data      = train,
+                             method    = 'ranger',
+                             trControl = cv,
+                             tuneGrid  = bagged_grid,
+                             metric    = 'logLoss',
+                             num.trees = nbags[i],
+                             max.depth = 60)
+ }
+#The saved RDS is to big to upload to GitHub 
 #saveRDS(bags, file='bags.rds')
-
-bags <- readRDS('bags.rds')
+#bags <- readRDS('bags.rds')
 logLoss_ <- c()
 
 for(i in 1:length(nbags)){
